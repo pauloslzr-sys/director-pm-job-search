@@ -181,8 +181,8 @@ class JobBoard:
         # Cap score at 100
         score = min(score, 100)
         
-        # Only return jobs with 30+ score
-        if score < 30:
+        # Only return jobs with 10+ score
+        if score < 10:
             return 0, []
         
         return score, list(set(matched_keywords))
