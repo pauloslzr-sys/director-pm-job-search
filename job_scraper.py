@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Director/VP Level PM Job Search Automation
-Scrapes multiple job boards, matches against resume, pushes to Google Sheets
+Director/VP Level PM Job Search Automation - Version 2
+Uses web scraping instead of RSS feeds for better results
 """
 
 import os
 import json
 import re
+import pickle
+import base64
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict
 import logging
@@ -14,9 +17,8 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 import gspread
-from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request
-import feedparser
+from google.oauth2.credentials import Credentials
 
 # Configure logging
 logging.basicConfig(
@@ -32,41 +34,29 @@ logger = logging.getLogger(__name__)
 RESUME_KEYWORDS = {
     'titles': [
         'director', 'vice president', 'vp', 'chief of staff', 'head of', 
-        'senior director', 'principal', 'chief transformation', 'chief strategy'
+        'senior director', 'principal'
     ],
     'pmo': [
         'pmo', 'project management office', 'portfolio management', 
-        'program management', 'enterprise governance', 'executive governance'
+        'program management', 'governance'
     ],
     'transformation': [
-        'transformation', 'change management', 'organizational change', 
-        'digital transformation', 'modernization', 'strategic planning', 'adkar'
-    ],
-    'strategy': [
-        'strategy', 'strategic planning', 'operating model', 'execution', 
-        'business alignment', 'enterprise strategy', 'organizational effectiveness'
+        'transformation', 'change management', 'digital transformation', 
+        'modernization', 'strategic'
     ],
     'leadership': [
-        'leadership', 'team leadership', 'executive partnership', 'coaching', 
-        'vision', 'stakeholder management', 'influence', 'executive presence'
+        'leadership', 'team leadership', 'executive', 'managing', 'leading'
     ],
     'skills': [
-        'pmp', 'prosci', 'certified change practitioner', 'agile', 'scrum', 
-        'lean six sigma', 'kanban', 'jira', 'msa', 'ms project', 'governance'
-    ],
-    'value': [
-        'cost avoidance', 'efficiency', 'risk management', 'adoption', 
-        'execution', 'delivery', 'resource planning', 'portfolio optimization'
+        'pmp', 'prosci', 'agile', 'scrum', 'lean', 'governance'
     ]
 }
 
 EXCLUDE_KEYWORDS = [
-    'pharmaceutical', 'pharma', 'drug', 'biotech', 'clinical trial', 'fda approval'
+    'pharmaceutical', 'pharma', 'drug', 'biotech', 'clinical', 'fda'
 ]
 
-TARGET_KEYWORDS = [
-    'remote', 'fully remote', 'work from home', 'virtual', 'distributed'
-]
+TARGET_KEYWORDS = ['remote', 'fully remote', 'work from home', 'virtual']
 
 SALARY_MINIMUM = 130000
 
@@ -75,18 +65,39 @@ SALARY_MINIMUM = 130000
 # ============================================================================
 
 def get_google_sheets_client():
-    """Authenticate and return Google Sheets client"""
+    """Authenticate and return Google Sheets client using OAuth 2.0"""
     try:
-        # Get credentials from environment variable (GitHub Secrets)
-        creds_json = os.getenv('GOOGLE_CREDENTIALS')
-        if not creds_json:
-            logger.error("GOOGLE_CREDENTIALS not found in environment")
+        creds = None
+        
+        # Try to get token from GitHub Secrets (base64 encoded)
+        token_b64 = os.getenv('GOOGLE_OAUTH_TOKEN')
+        if token_b64:
+            try:
+                # Decode from base64
+                token_data = base64.b64decode(token_b64)
+                creds = pickle.loads(token_data)
+                logger.info("Loaded OAuth credentials from GitHub Secrets")
+            except Exception as e:
+                logger.error(f"Failed to decode token from secrets: {e}")
+                return None
+        else:
+            logger.error("GOOGLE_OAUTH_TOKEN not found in environment")
             return None
         
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(creds_dict)
+        # Refresh token if expired
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                logger.info("Refreshed OAuth token")
+            except Exception as e:
+                logger.error(f"Failed to refresh token: {e}")
+                return None
+        
+        # Authorize gspread
         client = gspread.authorize(creds)
+        logger.info("Successfully authenticated with Google Sheets API")
         return client
+        
     except Exception as e:
         logger.error(f"Failed to authenticate Google Sheets: {e}")
         return None
@@ -108,9 +119,9 @@ def update_google_sheet(jobs: List[Dict], sheet_id: str):
                 job.get('title', ''),
                 job.get('url', ''),
                 job.get('salary', ''),
-                job.get('date_posted', ''),
-                job.get('match_score', ''),
-                job.get('description_summary', ''),
+                job.get('date_posted', datetime.now().strftime('%Y-%m-%d')),
+                job.get('match_score', 0),
+                job.get('description_summary', '')[:200],
                 job.get('board', ''),
                 job.get('keywords_matched', ''),
                 '',  # Application Status (manual)
@@ -120,7 +131,7 @@ def update_google_sheet(jobs: List[Dict], sheet_id: str):
         
         if rows:
             sheet.append_rows(rows, value_input_option='USER_ENTERED')
-            logger.info(f"Added {len(rows)} jobs to Google Sheet")
+            logger.info(f"✅ Added {len(rows)} jobs to Google Sheet")
             return True
         return False
     except Exception as e:
@@ -131,500 +142,301 @@ def update_google_sheet(jobs: List[Dict], sheet_id: str):
 # JOB SCRAPING FUNCTIONS
 # ============================================================================
 
-class JobBoard:
-    """Base class for job boards"""
+def calculate_match_score(job_text: str) -> tuple:
+    """Calculate match score (0-100) and matched keywords"""
+    job_text_lower = job_text.lower()
     
-    def __init__(self, name: str):
-        self.name = name
-        self.jobs = []
-    
-    def scrape(self) -> List[Dict]:
-        raise NotImplementedError
-    
-    def calculate_match_score(self, job_text: str) -> tuple:
-        """Calculate match score (0-100) and matched keywords"""
-        job_text_lower = job_text.lower()
-        
-        # Check for exclusions
-        for exclude in EXCLUDE_KEYWORDS:
-            if exclude in job_text_lower:
-                return 0, []
-        
-        # Check for remote requirement
-        has_remote = any(keyword in job_text_lower for keyword in TARGET_KEYWORDS)
-        if not has_remote:
+    # Check for exclusions
+    for exclude in EXCLUDE_KEYWORDS:
+        if exclude in job_text_lower:
             return 0, []
-        
-        # Calculate score based on keyword matches
-        matched_keywords = []
-        score = 0
-        
-        for category, keywords in RESUME_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in job_text_lower:
-                    matched_keywords.append(keyword)
-                    if category == 'titles':
-                        score += 20
-                    elif category == 'pmo':
-                        score += 15
-                    elif category == 'transformation':
-                        score += 15
-                    elif category == 'strategy':
-                        score += 10
-                    elif category == 'leadership':
-                        score += 10
-                    elif category == 'skills':
-                        score += 5
-                    elif category == 'value':
-                        score += 5
-        
-        # Cap score at 100
-        score = min(score, 100)
-        
-        # Only return jobs with 10+ score
-        if score < 10:
-            return 0, []
-        
-        return score, list(set(matched_keywords))
-
-
-class IndeedBoard(JobBoard):
-    """Indeed job scraper"""
     
-    def scrape(self) -> List[Dict]:
-        try:
-            # Using Indeed's RSS feed for remote PM jobs
-            rss_url = (
-                "https://www.indeed.com/rss?q="
-                "(director+OR+%22vice+president%22+OR+%22chief+of+staff%22)+"
-                "(pmo+OR+%22program+management%22+OR+%22project+management%22)+"
-                "%22remote%22&l=&sort=date"
-            )
-            
-            feed = feedparser.parse(rss_url)
-            
-            for entry in feed.entries[:15]:  # Limit to 15 most recent
-                job_text = f"{entry.title} {entry.summary}".lower()
-                match_score, keywords = self.calculate_match_score(job_text)
+    # Check for remote requirement
+    has_remote = any(keyword in job_text_lower for keyword in TARGET_KEYWORDS)
+    if not has_remote:
+        return 0, []
+    
+    # Calculate score based on keyword matches
+    matched_keywords = []
+    score = 0
+    
+    for category, keywords in RESUME_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in job_text_lower:
+                matched_keywords.append(keyword)
+                if category == 'titles':
+                    score += 20
+                elif category == 'pmo':
+                    score += 15
+                elif category == 'transformation':
+                    score += 12
+                elif category == 'leadership':
+                    score += 10
+                elif category == 'skills':
+                    score += 5
+    
+    # Cap score at 100
+    score = min(score, 100)
+    
+    # Lower threshold - accept 15+ (was 30)
+    if score < 15:
+        return 0, []
+    
+    return score, list(set(matched_keywords))
+
+# ============================================================================
+# SCRAPER IMPLEMENTATIONS
+# ============================================================================
+
+def scrape_indeed() -> List[Dict]:
+    """Scrape Indeed jobs"""
+    jobs = []
+    try:
+        logger.info("Scraping Indeed...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        # Indeed job search URL
+        url = (
+            "https://www.indeed.com/jobs?"
+            "q=director+OR+%22vice+president%22+pmo+program+management+"
+            "&l=remote&jt=fulltime"
+        )
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find job cards
+        job_cards = soup.find_all('div', class_='job_seen_beacon')
+        
+        for card in job_cards[:15]:
+            try:
+                # Extract job details
+                title_elem = card.find('h2', class_='jobTitle')
+                company_elem = card.find('span', class_='companyName')
+                location_elem = card.find('div', class_='companyLocation')
+                
+                if not title_elem:
+                    continue
+                
+                title = title_elem.get_text(strip=True)
+                company = company_elem.get_text(strip=True) if company_elem else 'Unknown'
+                url_elem = card.find('a', class_='jcs-JobTitle')
+                job_url = url_elem['href'] if url_elem else ''
+                
+                description_elem = card.find('div', class_='job-snippet')
+                description = description_elem.get_text(strip=True) if description_elem else ''
+                
+                job_text = f"{title} {description}".lower()
+                match_score, keywords = calculate_match_score(job_text)
                 
                 if match_score > 0:
-                    job = {
-                        'company': entry.get('company', 'Unknown'),
-                        'title': entry.title,
-                        'url': entry.link,
-                        'salary': extract_salary(entry.summary),
-                        'date_posted': entry.get('published', datetime.now().isoformat()),
-                        'match_score': match_score,
-                        'description_summary': entry.summary[:200],
-                        'board': 'Indeed',
-                        'keywords_matched': ', '.join(keywords[:5])
-                    }
-                    self.jobs.append(job)
-            
-            logger.info(f"Indeed: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"Indeed scrape failed: {e}")
-        
-        return self.jobs
-
-
-class ZipRecruiterBoard(JobBoard):
-    """ZipRecruiter job scraper"""
-    
-    def scrape(self) -> List[Dict]:
-        try:
-            params = {
-                'search': 'director OR "vice president" pmo OR "program management" remote',
-                'location': 'remote',
-                'days': '7'
-            }
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            # ZipRecruiter RSS feed
-            rss_url = (
-                "https://www.ziprecruiter.com/rss?"
-                "search=director+pmo+remote&location=remote&days_ago=7"
-            )
-            
-            feed = feedparser.parse(rss_url)
-            
-            for entry in feed.entries[:15]:
-                job_text = f"{entry.title} {entry.summary}".lower()
-                match_score, keywords = self.calculate_match_score(job_text)
-                
-                if match_score > 0:
-                    job = {
-                        'company': entry.get('author', 'Unknown'),
-                        'title': entry.title,
-                        'url': entry.link,
-                        'salary': extract_salary(entry.summary),
-                        'date_posted': entry.get('published', datetime.now().isoformat()),
-                        'match_score': match_score,
-                        'description_summary': entry.summary[:200],
-                        'board': 'ZipRecruiter',
-                        'keywords_matched': ', '.join(keywords[:5])
-                    }
-                    self.jobs.append(job)
-            
-            logger.info(f"ZipRecruiter: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"ZipRecruiter scrape failed: {e}")
-        
-        return self.jobs
-
-
-class LinkedInBoard(JobBoard):
-    """LinkedIn job scraper (RSS feed only - more reliable)"""
-    
-    def scrape(self) -> List[Dict]:
-        try:
-            # LinkedIn RSS feed for saved search
-            rss_url = (
-                "https://www.linkedin.com/jobs/feed/?keywords="
-                "(director%20OR%20%22vice%20president%22)%20"
-                "(pmo%20OR%20%22program%20management%22)%20"
-                "&geoId=103644278&trk=public_jobs_feed-header-home"
-            )
-            
-            feed = feedparser.parse(rss_url)
-            
-            for entry in feed.entries[:10]:
-                job_text = f"{entry.title} {entry.summary}".lower()
-                match_score, keywords = self.calculate_match_score(job_text)
-                
-                if match_score > 0:
-                    # Extract company from description
-                    company = extract_company_from_linkedin(entry.summary)
-                    
                     job = {
                         'company': company,
-                        'title': entry.title,
-                        'url': entry.link,
-                        'salary': extract_salary(entry.summary),
-                        'date_posted': entry.get('published', datetime.now().isoformat()),
+                        'title': title,
+                        'url': f"https://www.indeed.com{job_url}" if job_url.startswith('/') else job_url,
+                        'salary': '',
                         'match_score': match_score,
-                        'description_summary': entry.summary[:200],
-                        'board': 'LinkedIn',
-                        'keywords_matched': ', '.join(keywords[:5])
+                        'description_summary': description[:200],
+                        'board': 'Indeed',
+                        'keywords_matched': ', '.join(keywords[:5]),
+                        'date_posted': datetime.now().isoformat()
                     }
-                    self.jobs.append(job)
-            
-            logger.info(f"LinkedIn: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"LinkedIn scrape failed: {e}")
+                    jobs.append(job)
+            except Exception as e:
+                continue
         
-        return self.jobs
-
-
-class PMIJobBoard(JobBoard):
-    """PMI Career Center"""
+        logger.info(f"Indeed: Found {len(jobs)} matching jobs")
+    except Exception as e:
+        logger.error(f"Indeed scrape failed: {e}")
     
-    def scrape(self) -> List[Dict]:
-        try:
-            url = "https://www.pmi.org/careers/career-center/job-board"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            response = requests.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Note: PMI structure may vary - adjust selectors as needed
-            job_listings = soup.find_all('div', class_='job-listing')
-            
-            for listing in job_listings[:20]:
-                title_elem = listing.find('a', class_='job-title')
-                company_elem = listing.find('span', class_='company-name')
+    return jobs
+
+def scrape_ziprecruiter() -> List[Dict]:
+    """Scrape ZipRecruiter jobs"""
+    jobs = []
+    try:
+        logger.info("Scraping ZipRecruiter...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        url = (
+            "https://www.ziprecruiter.com/Jobs/director+pmo/remote"
+        )
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find job listings
+        job_listings = soup.find_all('div', class_='job_result')
+        
+        for listing in job_listings[:15]:
+            try:
+                title_elem = listing.find('a', class_='job_link')
+                if not title_elem:
+                    continue
                 
-                if title_elem and company_elem:
-                    title = title_elem.get_text(strip=True)
-                    company = company_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-                    description = listing.find('div', class_='description')
-                    desc_text = description.get_text(strip=True) if description else ""
+                title = title_elem.get_text(strip=True)
+                url = title_elem.get('href', '')
+                
+                company_elem = listing.find('a', class_='company_link')
+                company = company_elem.get_text(strip=True) if company_elem else 'Unknown'
+                
+                desc_elem = listing.find('div', class_='job_summary')
+                description = desc_elem.get_text(strip=True) if desc_elem else ''
+                
+                job_text = f"{title} {description}".lower()
+                match_score, keywords = calculate_match_score(job_text)
+                
+                if match_score > 0:
+                    job = {
+                        'company': company,
+                        'title': title,
+                        'url': url,
+                        'salary': '',
+                        'match_score': match_score,
+                        'description_summary': description[:200],
+                        'board': 'ZipRecruiter',
+                        'keywords_matched': ', '.join(keywords[:5]),
+                        'date_posted': datetime.now().isoformat()
+                    }
+                    jobs.append(job)
+            except Exception as e:
+                continue
+        
+        logger.info(f"ZipRecruiter: Found {len(jobs)} matching jobs")
+    except Exception as e:
+        logger.error(f"ZipRecruiter scrape failed: {e}")
+    
+    return jobs
+
+def scrape_linkedin() -> List[Dict]:
+    """Scrape LinkedIn jobs"""
+    jobs = []
+    try:
+        logger.info("Scraping LinkedIn...")
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        url = (
+            "https://www.linkedin.com/jobs/search/?"
+            "keywords=director%20pmo&location=remote&"
+            "geoId=103644278&trk=public_jobs_feed-header-home"
+        )
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find job cards
+        job_cards = soup.find_all('div', class_='base-card')
+        
+        for card in job_cards[:15]:
+            try:
+                title_elem = card.find('h3', class_='base-search-card__title')
+                company_elem = card.find('h4', class_='base-search-card__subtitle')
+                link_elem = card.find('a', class_='base-card__full-link')
+                
+                if not title_elem or not link_elem:
+                    continue
+                
+                title = title_elem.get_text(strip=True)
+                company = company_elem.get_text(strip=True) if company_elem else 'Unknown'
+                url = link_elem.get('href', '')
+                
+                job_text = title.lower()
+                match_score, keywords = calculate_match_score(job_text)
+                
+                if match_score > 0:
+                    job = {
+                        'company': company,
+                        'title': title,
+                        'url': url,
+                        'salary': '',
+                        'match_score': match_score,
+                        'description_summary': 'See LinkedIn for details',
+                        'board': 'LinkedIn',
+                        'keywords_matched': ', '.join(keywords[:5]),
+                        'date_posted': datetime.now().isoformat()
+                    }
+                    jobs.append(job)
+            except Exception as e:
+                continue
+        
+        logger.info(f"LinkedIn: Found {len(jobs)} matching jobs")
+    except Exception as e:
+        logger.error(f"LinkedIn scrape failed: {e}")
+    
+    return jobs
+
+def scrape_usajobs() -> List[Dict]:
+    """Scrape USAJobs federal jobs"""
+    jobs = []
+    try:
+        logger.info("Scraping USAJobs...")
+        
+        url = "https://data.usajobs.gov/api/search"
+        headers = {
+            'Host': 'data.usajobs.gov',
+            'User-Agent': 'Mozilla/5.0'
+        }
+        
+        params = {
+            'Keyword': 'director program management pmo',
+            'LocationName': 'remote',
+            'ResultsPerPage': 50
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            for job_item in data.get('SearchResult', {}).get('SearchResultItems', [])[:15]:
+                try:
+                    matched = job_item.get('MatchedObjectDescriptor', {})
+                    title = matched.get('JobTitle', '')
+                    company = matched.get('DepartmentName', '')
+                    description = matched.get('JobSummary', '')
                     
-                    job_text = f"{title} {desc_text}".lower()
-                    match_score, keywords = self.calculate_match_score(job_text)
+                    job_text = f"{title} {description}".lower()
+                    match_score, keywords = calculate_match_score(job_text)
                     
                     if match_score > 0:
-                        job = {
-                            'company': company,
-                            'title': title,
-                            'url': f"https://www.pmi.org{url}" if url.startswith('/') else url,
-                            'salary': extract_salary(desc_text),
-                            'date_posted': datetime.now().isoformat(),
-                            'match_score': match_score,
-                            'description_summary': desc_text[:200],
-                            'board': 'PMI Job Board',
-                            'keywords_matched': ', '.join(keywords[:5])
-                        }
-                        self.jobs.append(job)
-            
-            logger.info(f"PMI: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"PMI scrape failed: {e}")
-        
-        return self.jobs
-
-
-class USAJobsBoard(JobBoard):
-    """USAJobs federal government jobs"""
-    
-    def scrape(self) -> List[Dict]:
-        try:
-            # USAJobs API
-            url = "https://data.usajobs.gov/api/search"
-            headers = {
-                'Host': 'data.usajobs.gov',
-                'User-Agent': 'Mozilla/5.0',
-                'Authorization-Key': os.getenv('USAJOBS_API_KEY', 'test')  # Free API key from USAJobs
-            }
-            
-            params = {
-                'Keyword': 'director program management OR pmo',
-                'LocationName': 'remote',
-                'ResultsPerPage': 100,
-                'WhoMayApply': 'all'
-            }
-            
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                for job in data.get('SearchResult', {}).get('SearchResultItems', [])[:20]:
-                    matched_job = job.get('MatchedObjectDescriptor', {})
-                    title = matched_job.get('JobTitle', '')
-                    company = matched_job.get('DepartmentName', '')
-                    desc = matched_job.get('JobSummary', '')
-                    
-                    job_text = f"{title} {desc}".lower()
-                    match_score, keywords = self.calculate_match_score(job_text)
-                    
-                    if match_score > 0:
-                        salary_info = matched_job.get('PositionRemuneration', [{}])[0]
-                        salary = salary_info.get('RangeTo', '')
+                        apply_url = matched.get('ApplyURI', [{}])[0].get('ApplicationURI', '')
                         
-                        job_obj = {
+                        job = {
                             'company': company,
                             'title': title,
-                            'url': matched_job.get('ApplyURI', {}).get('ApplicationURI', ''),
-                            'salary': f"${salary}" if salary else '',
-                            'date_posted': matched_job.get('PublicationStartDate', ''),
+                            'url': apply_url,
+                            'salary': '',
                             'match_score': match_score,
-                            'description_summary': desc[:200],
+                            'description_summary': description[:200],
                             'board': 'USAJobs',
-                            'keywords_matched': ', '.join(keywords[:5])
+                            'keywords_matched': ', '.join(keywords[:5]),
+                            'date_posted': matched.get('PublicationStartDate', '')
                         }
-                        self.jobs.append(job_obj)
-                
-                logger.info(f"USAJobs: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"USAJobs scrape failed: {e}")
+                        jobs.append(job)
+                except Exception as e:
+                    continue
         
-        return self.jobs
-
-
-class IdealistBoard(JobBoard):
-    """Idealist.org nonprofit job board"""
+        logger.info(f"USAJobs: Found {len(jobs)} matching jobs")
+    except Exception as e:
+        logger.error(f"USAJobs scrape failed: {e}")
     
-    def scrape(self) -> List[Dict]:
-        try:
-            url = "https://www.idealist.org/en/jobs"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            params = {
-                'q': 'director OR "program management" OR pmo',
-                'location': 'remote',
-                'type': 'full-time'
-            }
-            
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            job_cards = soup.find_all('div', class_='posting')
-            
-            for card in job_cards[:20]:
-                title_elem = card.find('a', class_='job-title')
-                org_elem = card.find('span', class_='organization-name')
-                
-                if title_elem and org_elem:
-                    title = title_elem.get_text(strip=True)
-                    company = org_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-                    
-                    job_text = title.lower()
-                    match_score, keywords = self.calculate_match_score(job_text)
-                    
-                    if match_score > 0:
-                        job = {
-                            'company': company,
-                            'title': title,
-                            'url': f"https://www.idealist.org{url}" if url.startswith('/') else url,
-                            'salary': '',
-                            'date_posted': datetime.now().isoformat(),
-                            'match_score': match_score,
-                            'description_summary': 'See Idealist.org for details',
-                            'board': 'Idealist.org',
-                            'keywords_matched': ', '.join(keywords[:5])
-                        }
-                        self.jobs.append(job)
-            
-            logger.info(f"Idealist: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"Idealist scrape failed: {e}")
-        
-        return self.jobs
-
-
-class BuiltInBoard(JobBoard):
-    """Built In startup jobs"""
-    
-    def scrape(self) -> List[Dict]:
-        try:
-            url = "https://builtin.com/jobs"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            params = {
-                'q': 'director OR "program management" OR pmo',
-                'location': 'remote'
-            }
-            
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            job_cards = soup.find_all('div', class_='job-card')
-            
-            for card in job_cards[:20]:
-                title_elem = card.find('a', class_='job-link')
-                company_elem = card.find('span', class_='company')
-                
-                if title_elem and company_elem:
-                    title = title_elem.get_text(strip=True)
-                    company = company_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-                    
-                    job_text = title.lower()
-                    match_score, keywords = self.calculate_match_score(job_text)
-                    
-                    if match_score > 0:
-                        job = {
-                            'company': company,
-                            'title': title,
-                            'url': url,
-                            'salary': '',
-                            'date_posted': datetime.now().isoformat(),
-                            'match_score': match_score,
-                            'description_summary': 'See Built In for details',
-                            'board': 'Built In',
-                            'keywords_matched': ', '.join(keywords[:5])
-                        }
-                        self.jobs.append(job)
-            
-            logger.info(f"Built In: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"Built In scrape failed: {e}")
-        
-        return self.jobs
-
-
-class FlexjobsBoard(JobBoard):
-    """Flexjobs (requires subscription, but RSS feed available to members)"""
-    
-    def scrape(self) -> List[Dict]:
-        try:
-            # Flexjobs has limited free access - using public job feed
-            url = "https://www.flexjobs.com/jobs"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            
-            params = {
-                'search': 'director pmo program management',
-                'type': 'remote'
-            }
-            
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            job_listings = soup.find_all('div', class_='job-listing')
-            
-            for listing in job_listings[:15]:
-                title_elem = listing.find('a', class_='title')
-                
-                if title_elem:
-                    title = title_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-                    
-                    job_text = title.lower()
-                    match_score, keywords = self.calculate_match_score(job_text)
-                    
-                    if match_score > 0:
-                        job = {
-                            'company': listing.find('span', class_='company').get_text(strip=True) if listing.find('span', class_='company') else 'Unknown',
-                            'title': title,
-                            'url': f"https://www.flexjobs.com{url}" if url.startswith('/') else url,
-                            'salary': '',
-                            'date_posted': datetime.now().isoformat(),
-                            'match_score': match_score,
-                            'description_summary': 'Flexjobs member access required',
-                            'board': 'Flexjobs',
-                            'keywords_matched': ', '.join(keywords[:5])
-                        }
-                        self.jobs.append(job)
-            
-            logger.info(f"Flexjobs: Found {len(self.jobs)} matching jobs")
-        except Exception as e:
-            logger.error(f"Flexjobs scrape failed: {e}")
-        
-        return self.jobs
-
+    return jobs
 
 # ============================================================================
-# UTILITY FUNCTIONS
+# MAIN EXECUTION
 # ============================================================================
-
-def extract_salary(text: str) -> str:
-    """Extract salary information from text"""
-    try:
-        # Look for salary patterns like $130,000 or $130K
-        salary_patterns = [
-            r'\$[\d,]+(?:k|K)?(?:\s*-\s*\$[\d,]+(?:k|K)?)?',
-            r'[\d,]+\s*(?:to|-)\s*[\d,]+\s*(?:year|annually|per year)',
-        ]
-        
-        for pattern in salary_patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(0)
-        
-        return ''
-    except:
-        return ''
-
-
-def extract_company_from_linkedin(text: str) -> str:
-    """Extract company name from LinkedIn job description"""
-    try:
-        # LinkedIn format typically has company near the beginning
-        lines = text.split('\n')
-        for line in lines[:5]:
-            if 'company' not in line.lower():
-                return line.strip()
-        return 'Unknown'
-    except:
-        return 'Unknown'
-
 
 def deduplicate_jobs(all_jobs: List[Dict]) -> List[Dict]:
-    """Remove duplicate jobs based on title and company"""
+    """Remove duplicate jobs"""
     seen = set()
     unique_jobs = []
     
@@ -636,82 +448,49 @@ def deduplicate_jobs(all_jobs: List[Dict]) -> List[Dict]:
     
     return unique_jobs
 
-
 def sort_jobs_by_score(jobs: List[Dict]) -> List[Dict]:
-    """Sort jobs by match score (highest first)"""
+    """Sort jobs by match score"""
     return sorted(jobs, key=lambda x: x['match_score'], reverse=True)
 
-
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
 def main():
-    """Main execution function"""
-    logger.info("Starting job search automation...")
+    """Main execution"""
+    logger.info("🔍 Starting job search automation...")
     
     all_jobs = []
     
-    # Initialize job boards
-    boards = [
-        IndeedBoard('Indeed'),
-        ZipRecruiterBoard('ZipRecruiter'),
-        LinkedInBoard('LinkedIn'),
-        PMIJobBoard('PMI Job Board'),
-        USAJobsBoard('USAJobs'),
-        IdealistBoard('Idealist.org'),
-        BuiltInBoard('Built In'),
-        FlexjobsBoard('Flexjobs'),
-    ]
-    
     # Scrape each board
-    for board in boards:
-        logger.info(f"Scraping {board.name}...")
-        try:
-            jobs = board.scrape()
-            all_jobs.extend(jobs)
-        except Exception as e:
-            logger.error(f"Error scraping {board.name}: {e}")
+    all_jobs.extend(scrape_indeed())
+    time.sleep(2)  # Be respectful to servers
+    
+    all_jobs.extend(scrape_ziprecruiter())
+    time.sleep(2)
+    
+    all_jobs.extend(scrape_linkedin())
+    time.sleep(2)
+    
+    all_jobs.extend(scrape_usajobs())
     
     # Process results
-    logger.info(f"Total jobs found: {len(all_jobs)}")
+    logger.info(f"📊 Total jobs found: {len(all_jobs)}")
     
     all_jobs = deduplicate_jobs(all_jobs)
     all_jobs = sort_jobs_by_score(all_jobs)
     
-    logger.info(f"After deduplication: {len(all_jobs)} unique jobs")
+    logger.info(f"✨ After deduplication: {len(all_jobs)} unique jobs")
     
-    # Filter by salary if provided
-    filtered_jobs = []
-    for job in all_jobs:
-        salary_str = job.get('salary', '')
-        if salary_str:
-            try:
-                # Extract numeric salary
-                salary_num = int(re.search(r'[\d,]+', salary_str.replace(',', '')).group())
-                if salary_num >= SALARY_MINIMUM:
-                    filtered_jobs.append(job)
-            except:
-                filtered_jobs.append(job)  # Include if we can't parse
-        else:
-            filtered_jobs.append(job)  # Include if no salary listed
-    
-    logger.info(f"After salary filter (${SALARY_MINIMUM}+): {len(filtered_jobs)} jobs")
-    
-    # Update Google Sheet
+    # Update sheet
     sheet_id = os.getenv('GOOGLE_SHEET_ID')
-    if sheet_id and filtered_jobs:
-        success = update_google_sheet(filtered_jobs, sheet_id)
+    if sheet_id and all_jobs:
+        success = update_google_sheet(all_jobs, sheet_id)
         if success:
-            logger.info(f"Successfully updated Google Sheet with {len(filtered_jobs)} jobs")
+            logger.info(f"🎉 Successfully updated Google Sheet with {len(all_jobs)} jobs")
         else:
             logger.warning("Failed to update Google Sheet")
     else:
-        logger.warning(f"No sheet ID provided or no jobs to add (jobs: {len(filtered_jobs)})")
+        logger.warning(f"No sheet ID or no jobs to add")
     
-    logger.info("Job search automation completed")
-    return len(filtered_jobs)
-
+    logger.info("✅ Job search automation completed")
+    return len(all_jobs)
 
 if __name__ == '__main__':
     main()
